@@ -1,0 +1,239 @@
+% =========================================================
+% Realizable HLPSL model for DO–DU protocol
+% (Initialization, Registration, Data Request/AK exchange)
+% =========================================================
+
+% ---------- Hashes & Abstract Operations ----------
+hash_function h/1.
+hash_function h1/1.
+
+% Abstract symbolic operations to stand in for EC/pairings/etc.
+function exp/2.
+function mul/2.
+function pair/2.
+function add/2.
+function kdf2/2.      % session key derivation (DO<->DU)
+function kdf3/3.      % session key derivation (DO<->FN) using (c1, sk_do, pk_fn)
+
+% ---------- Global Constants ----------
+const g, G, g1, gn : message.
+const DID_DO, DID_DU : text.
+const ind : text.
+
+% ---------- Channel Model ----------
+channel(dy).
+
+% =========================================================
+% ROLE: DATA OWNER (DO)
+% =========================================================
+role DO(
+    DO, DU, FN : agent,
+    sk_do, pk_do, sk_sdo, pk_sdo, pk_du, sk_fn, pk_fn : public_key
+)
+played_by DO
+def=
+
+local
+    % Nonces
+    n1, c1, rn1, rn2, c2 : nonce
+
+    % Messages/terms
+    CT1_DU, CT1_DO, CT2_DO, Eakey : message
+    m1, UploadData, cp1, cp2, cp3, INDX : message
+    akey : message
+
+    % Session Keys
+    sk_do_du : symmetric_key
+    sk_do_fn : symmetric_key
+
+init
+    state := 0
+
+transition
+
+    % ------------------ Registration (DO <-> FN) ------------------
+    1. state = 0
+       -> 
+       n1' := new() ;
+       snd(DO, FN, {DID_DO, n1'}) ;
+       state := 1
+
+    2. state = 1
+       recv(FN, DO, c1')
+       ->
+       m_reg' := (DID_DO.n1'.c1') ;
+       sig_do' := { m_reg' }_sk_do ;           
+       snd(DO, FN, {sig_do'}) ;
+
+       sk_do_fn' := new() ;                     
+       state := 2
+
+    % ------------------ Data Request / Aggregate Key Exchange ------------------
+    3. state = 2
+       recv(DU, DO, {CT1_DU', DID_DU, c1''})
+       ->
+       rn2' := new() ;
+       c2'  := new() ;
+
+       CT1_DO' := mul(G, rn2') ;
+
+       m1' := (DID_DO.DID_DU.c1''.c2'.CT1_DU'.CT1_DO') ;
+
+       CT2_DO' := { m1' }_sk_do ;
+
+       % Session key for DO-DU
+       sk_do_du' := new() ;                     
+       akey' := h( DID_DO.DID_DU.m1' ) ;      
+       Eakey' := { akey' }_sk_do_du' ;
+
+       % S2: DO -> DU : Eakey, c2, CT1_DO, CT2_DO
+       snd(DO, DU, {Eakey', c2', CT1_DO', CT2_DO'}) ;
+
+       % Authentication event: DO claims it talked to DU on m1'
+       witness(DO, DU, do_du_auth, m1') ;
+
+       % Secrecy claims
+       secret(sk_do_du', sk_do_du_secret, {DO,DU}) ;
+       secret(akey', akey_secret, {DO,DU}) ;
+
+       state := 3
+
+end role
+
+% =========================================================
+% ROLE: DATA USER (DU)
+% =========================================================
+role DU(
+    DU, DO : agent,
+    pk_do : public_key
+)
+played_by DU
+def=
+
+local
+    rn1, c1, c2 : nonce
+    CT1_DU, CT1_DO, CT2_DO, Eakey : message
+    m2 : message
+    sk_du_do : symmetric_key
+    akey : message
+
+init
+    state := 0
+
+transition
+
+    % ------------------ Data Request Init ------------------
+    1. state = 0
+       rn1' := new() ;
+       c1'  := new() ;
+       CT1_DU' := mul(G, rn1') ;
+       snd(DU, DO, {CT1_DU', DID_DU, c1'}) ;
+       state := 1
+
+    % ------------------ Receive Eakey & Verify DO ------------------
+    2. state = 1
+       recv(DO, DU, {Eakey', c2', CT1_DO', CT2_DO'})
+       ->
+       m2' := (DID_DO.DID_DU.c1'.c2'.CT1_DU'.CT1_DO') ;
+
+       request(DU, DO, do_du_auth, m2') ;
+
+       % Compute session key 
+       sk_du_do' := new() ;
+
+       akey' := d(Eakey', sk_du_do') ;
+
+       secret(sk_du_do', sk_du_do_secret, {DO,DU}) ;
+       secret(akey', akey_secret, {DO,DU}) ;
+
+       state := 2
+
+end role
+
+% =========================================================
+% ROLE: FN (Federated Node/Network)
+% =========================================================
+role FN(
+    FN, DO : agent,
+    pk_do, sk_fn, pk_fn : public_key
+)
+played_by FN
+def=
+
+local
+    c1 : nonce
+    sig_do : message
+    UploadData : message
+    sk_fn_do : symmetric_key
+    m_reg : message
+
+init
+    state := 0
+
+transition
+
+    % ------------------ Registration with DO ------------------
+    1. state = 0
+       recv(DO, FN, {DID_DO, ?n1})
+       ->
+       c1' := new() ;
+       snd(FN, DO, c1') ;
+       state := 1
+
+    2. state = 1
+       recv(DO, FN, {sig_do'})
+       ->
+       sk_fn_do' := new() ;
+       % Authentication note
+       m_reg' := (DID_DO.n1.c1') ;
+       request(FN, DO, do_fn_auth, m_reg') ;
+
+       secret(sk_fn_do', sk_do_fn_secret, {DO,FN}) ;
+
+       state := 2
+
+end role
+
+% =========================================================
+% SESSION & ENVIRONMENT
+% =========================================================
+role session()
+def=
+  local
+    DO, DU, FN : agent
+    sk_do, pk_do, sk_sdo, pk_sdo, pk_du, sk_fn, pk_fn : public_key
+  composition
+    DO(DO, DU, FN, sk_do, pk_do, sk_sdo, pk_sdo, pk_du, sk_fn, pk_fn)
+    DU(DU, DO, pk_do)
+    FN(FN, DO, pk_do, sk_fn, pk_fn)
+end role
+
+role environment()
+def=
+  const do, du, fn : agent
+  const sk_do, pk_do, sk_sdo, pk_sdo, sk_du, pk_du, sk_fn, pk_fn : public_key
+
+  intruder_knowledge = { do, du, fn, pk_do, pk_sdo, pk_du, pk_fn,
+                         g, G, g1, gn, DID_DO, DID_DU, ind }
+
+  inverse_keys(sk_do, pk_do).
+  inverse_keys(sk_sdo, pk_sdo).
+  inverse_keys(sk_fn, pk_fn).
+
+  composition
+    session()
+
+end role
+
+% =========================================================
+% SECURITY GOALS
+% =========================================================
+goal
+  secrecy_of sk_do_du_secret, sk_du_do_secret, sk_do_fn_secret, akey_secret
+
+  authentication_on do_du_auth
+
+  authentication_on do_fn_auth
+end goal
+
+environment().
